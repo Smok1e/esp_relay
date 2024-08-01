@@ -1,0 +1,56 @@
+menu "Relay"
+    config WIFI_SSID
+        string "WiFi SSID"
+        default ""
+        help
+            WiFi network name
+
+    config WIFI_PASSWORD
+        string "WiFi Password"
+        default ""
+        help
+            WiFi network password
+
+    config WIFI_DISABLE_DHCP
+        bool "Disable DHCP"
+        default y
+        help
+            Disable DHCP to set preferred ip address; This may not work with some APs
+
+    config WIFI_IP
+        string "WiFi station ip address"
+        default "192.168.1.32"
+        help
+            Set preferred network ip address
+
+    config WIFI_GATEWAY
+        string "WiFi gateway ip address"
+        default "192.168.1.1"
+        help
+            Set network gateway address
+
+    config WIFI_NETMASK
+        string "WiFi network mask"
+        default "255.255.255.0"
+        help
+            Set network mask
+
+    config SERVER_PORT
+        int "TCP server port"
+        default 1488
+        help
+            Set tcp server port
+
+    config GPIO_RELAY_PIN
+        int "Relay GPIO pin"
+        default 2
+        help
+            Set GPIO pin wich controls a relay
+
+    config GPIO_LED_PIN
+        int "LED gpio pin"
+        default 8
+        help
+            Set led GPIO pin
+
+endmenu
