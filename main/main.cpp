@@ -1,5 +1,7 @@
 #include <array>
 #include <mutex>
+#include <algorithm>
+#include <cmath>
 
 #include "FreeRTOS/FreeRTOS.h"
 #include "freertos/task.h"
@@ -10,34 +12,27 @@
 #include "esp_log.h"
 #include "esp_netif.h"
 #include "esp_event.h"
+
 #include "nvs_flash.h"
 
 #include "lwip/err.h"
 #include "lwip/sockets.h"
 #include "lwip/sys.h"
 
+#include "driver/gpio.h"
+#include "driver/ledc.h"
+
 #include "utils.hpp"
-#include "pintimer.hpp"
+
+//======================================================= Constants
+
+#define WIFI_CONNECTED_BIT BIT0
 
 static const char* TAG = "main";
 
-#define WIFI_CONNECTED_BIT BIT0
-#define MAX_IP4_LEN        16
-
-//=======================================================
-
-int NetCheck(int status, const char* expr)
-{
-	if (status < 0)
-	{
-		ESP_LOGE(TAG, "%s failed with errno %d: %s; Aborting", expr, errno, strerror(errno));
-		abort();
-	}
-
-	return status;
-}
-
-#define __net_check(expr) NetCheck(expr, #expr)
+constexpr size_t MAX_IP4_LEN = 16;
+constexpr auto   GPIO_RELAY_PIN = static_cast<gpio_num_t>(CONFIG_GPIO_RELAY_PIN);
+constexpr auto   GPIO_LED_PIN   = static_cast<gpio_num_t>(CONFIG_GPIO_LED_PIN  );
 
 //=======================================================
 
@@ -49,8 +44,12 @@ public:
 	void run();
 
 private:
-	PinTimer m_relay_timer { static_cast<gpio_num_t>(CONFIG_GPIO_RELAY_PIN) };
-	PinTimer m_led_timer   { static_cast<gpio_num_t>(CONFIG_GPIO_LED_PIN)   };
+	TickType_t m_last_update_ticks;
+	TickType_t m_activate_for;
+
+	static void TimerTaskProc(void* arg);
+	[[noreturn]]
+	void startTimer();
 
 	[[noreturn]]
 	void startTcpServer();
@@ -68,27 +67,81 @@ private:
 
 };
 
+//======================================================= GPIO
+
+void Main::TimerTaskProc(void* arg)
+{
+	reinterpret_cast<Main*>(arg)->startTimer();
+}
+
+[[noreturn]]
+void Main::startTimer()
+{
+	// Relay pin configuration
+	gpio_reset_pin(GPIO_RELAY_PIN);
+	gpio_set_direction(GPIO_RELAY_PIN, GPIO_MODE_OUTPUT);
+
+	// Led pin configuration
+	ledc_timer_config_t timer_cfg = {};
+	timer_cfg.speed_mode      = LEDC_LOW_SPEED_MODE;
+	timer_cfg.duty_resolution = LEDC_TIMER_13_BIT;
+	timer_cfg.timer_num       = LEDC_TIMER_0;
+	timer_cfg.freq_hz         = 4000;
+	timer_cfg.clk_cfg         = LEDC_AUTO_CLK;
+	ESP_ERROR_CHECK(ledc_timer_config(&timer_cfg));
+
+	ledc_channel_config_t channel_cfg = {};
+	channel_cfg.speed_mode = LEDC_LOW_SPEED_MODE;
+	channel_cfg.channel    = LEDC_CHANNEL_0;
+	channel_cfg.timer_sel  = LEDC_TIMER_0;
+	channel_cfg.intr_type  = LEDC_INTR_DISABLE;
+	channel_cfg.gpio_num   = GPIO_LED_PIN;
+	channel_cfg.duty       = 0;
+	channel_cfg.hpoint     = 0;
+	ESP_ERROR_CHECK(ledc_channel_config(&channel_cfg));
+
+	while (true)
+	{
+		auto ticks_since_update = xTaskGetTickCount() - m_last_update_ticks;
+
+		// Updating relay pin
+		ESP_ERROR_CHECK(gpio_set_level(GPIO_RELAY_PIN, ticks_since_update < m_activate_for));
+
+		// Updating led
+		ESP_ERROR_CHECK(ledc_set_duty(
+			LEDC_LOW_SPEED_MODE,
+			LEDC_CHANNEL_0,
+			4096 * std::pow(1.f - std::clamp<float>(ticks_since_update, 0, m_activate_for) / m_activate_for, 3)
+		));
+
+		ESP_ERROR_CHECK(ledc_update_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0));
+
+		// Sleeping for 10 ms
+		vTaskDelay(10 / portTICK_PERIOD_MS);
+	}
+}
+
 //======================================================= Server
 
 [[noreturn]]
 void Main::startTcpServer()
 {
-	int server = __net_check(socket(AF_INET, SOCK_STREAM, 0));
+	int server = NET_CHECK(socket(AF_INET, SOCK_STREAM, 0));
 
 	// Binding to preferred port
 	sockaddr_in server_addr = {};
 	server_addr.sin_family = AF_INET;
 	server_addr.sin_addr.s_addr = htonl(INADDR_ANY);
 	server_addr.sin_port = htons(CONFIG_SERVER_PORT);
-	__net_check(bind(server, reinterpret_cast<sockaddr*>(&server_addr), sizeof(server_addr)));
+	NET_CHECK(bind(server, reinterpret_cast<sockaddr*>(&server_addr), sizeof(server_addr)));
 
 	// Allow up to 5 pending connections
-	__net_check(listen(server, 5));
+	NET_CHECK(listen(server, 5));
 
 	ESP_LOGI(TAG, "listening for connections port %d", CONFIG_SERVER_PORT);
 	while (true)
 	{
-		int client = __net_check(accept(server, nullptr, nullptr));
+		int client = NET_CHECK(accept(server, nullptr, nullptr));
 
 		std::pair<Main*, int> info(this, client);
 		xTaskCreate(Main::ServeClientTaskProc, "Client server", 4096, &info, 5, nullptr);
@@ -135,11 +188,8 @@ void Main::onDataReceived(int client, const char* data, size_t len)
 	}
 
 	// Just interpreting received data as 32 bit unsigned
-	const auto& timeout_ms = *reinterpret_cast<const uint32_t*>(data);
-	m_relay_timer.activateFor(timeout_ms / portTICK_PERIOD_MS);
-
-	// Blink builtin led for 100 ms to indicate that we have received request
-	m_led_timer.activateFor(100 / portTICK_PERIOD_MS);
+	m_activate_for = *reinterpret_cast<const uint32_t*>(data) / portTICK_PERIOD_MS;
+	m_last_update_ticks = xTaskGetTickCount();
 }
 
 //======================================================= Wifi
@@ -254,6 +304,7 @@ void Main::run()
 	initNVS();
 	initWifi();
 
+	xTaskCreate(TimerTaskProc, "GPIO timer task", 4096, this, 5, nullptr);
 	startTcpServer();
 }
 

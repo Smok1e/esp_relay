@@ -22,3 +22,16 @@ esp_err_t StrToIP4Addr(const char* str, esp_ip4_addr* addr)
 }
 
 //=======================================================
+
+int NetCheck(int status, const char* tag, const char* expr)
+{
+	if (status < 0)
+	{
+		ESP_LOGE(tag, "%s failed with errno %d: %s; Aborting", expr, errno, strerror(errno));
+		abort();
+	}
+
+	return status;
+}
+
+//=======================================================
