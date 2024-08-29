@@ -44,8 +44,9 @@ public:
 	void run();
 
 private:
-	TickType_t m_last_update_ticks;
-	TickType_t m_activate_for;
+	TickType_t m_last_update_ticks { 0 };
+	TickType_t m_activate_for      { 0 };
+	bool       m_should_blink      { false };
 
 	static void TimerTaskProc(void* arg);
 	[[noreturn]]
@@ -100,6 +101,7 @@ void Main::startTimer()
 	channel_cfg.hpoint     = 0;
 	ESP_ERROR_CHECK(ledc_channel_config(&channel_cfg));
 
+	TickType_t blink_start_ticks = 0;
 	while (true)
 	{
 		auto ticks_since_update = xTaskGetTickCount() - m_last_update_ticks;
@@ -107,11 +109,25 @@ void Main::startTimer()
 		// Updating relay pin
 		ESP_ERROR_CHECK(gpio_set_level(GPIO_RELAY_PIN, ticks_since_update < m_activate_for));
 
+		if (m_should_blink)
+		{
+			blink_start_ticks = xTaskGetTickCount();
+			m_should_blink = false;
+		}
+
+		uint32_t duty = 4096 * (
+			xTaskGetTickCount() - blink_start_ticks < (100 / portTICK_PERIOD_MS)
+				? 1
+				: m_activate_for > 0
+					? std::pow(1.f - std::clamp<float>(ticks_since_update, 0, m_activate_for) / m_activate_for, 5)
+					: 0
+		);
+
 		// Updating led
 		ESP_ERROR_CHECK(ledc_set_duty(
 			LEDC_LOW_SPEED_MODE,
 			LEDC_CHANNEL_0,
-			4096 * std::pow(1.f - std::clamp<float>(ticks_since_update, 0, m_activate_for) / m_activate_for, 3)
+			duty
 		));
 
 		ESP_ERROR_CHECK(ledc_update_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0));
@@ -148,7 +164,7 @@ void Main::startTcpServer()
 	}
 }
 
-void Main::ServeClientTaskProc(void *arg)
+void Main::ServeClientTaskProc(void* arg)
 {
 	auto& info = *reinterpret_cast<std::pair<Main*, int>*>(arg);
 	info.first->serveClient(info.second);
@@ -183,13 +199,16 @@ void Main::onDataReceived(int client, const char* data, size_t len)
 {
 	if (len != sizeof(uint32_t))
 	{
-		ESP_LOGW(TAG, "received %zu bytes instead of %zu", len, sizeof(uint32_t));
+		ESP_LOGI(TAG, "received %zu bytes instead of %zu", len, sizeof(uint32_t));
 		return;
 	}
 
-	// Just interpreting received data as 32 bit unsigned
-	m_activate_for = *reinterpret_cast<const uint32_t*>(data) / portTICK_PERIOD_MS;
-	m_last_update_ticks = xTaskGetTickCount();
+	for (size_t i = 0; i < len / 4; i++)
+	{
+		// Just interpreting received data as 32 bit unsigned integers
+		m_activate_for = reinterpret_cast<const uint32_t*>(data)[i] / portTICK_PERIOD_MS;
+		m_last_update_ticks = xTaskGetTickCount();
+	}
 }
 
 //======================================================= Wifi
@@ -207,7 +226,7 @@ void Main::initNVS()
 	ESP_LOGI(TAG, "nvs initialized");
 }
 
-void Main::WifiEventHandler(void *arg, esp_event_base_t event_base, int32_t event_id, void *event_data)
+void Main::WifiEventHandler(void* arg, esp_event_base_t event_base, int32_t event_id, void* event_data)
 {
 	Main* instance = reinterpret_cast<Main*>(arg);
 
@@ -225,13 +244,25 @@ void Main::onWifiEvent(int32_t event_id, void *event_data)
 			break;
 
 		case WIFI_EVENT_STA_DISCONNECTED:
+		{
+			m_should_blink = true;
+
 			esp_wifi_connect();
-			ESP_LOGI(TAG, "reconnecting to %s...", CONFIG_WIFI_SSID);
+			ESP_LOGI(
+				TAG,
+				"wifi disconnected (%d); reconnecting to %s...",
+				static_cast<int>(
+					reinterpret_cast<wifi_event_sta_disconnected_t*>(event_data)->reason
+				),
+				CONFIG_WIFI_SSID
+			);
+
 			break;
+		}
 	}
 }
 
-void Main::onIpEvent(int32_t event_id, void *event_data)
+void Main::onIpEvent(int32_t event_id, void* event_data)
 {
 	switch (event_id)
 	{
@@ -272,7 +303,7 @@ void Main::initWifi()
 	));
 
 	wifi_config_t wifi_config = {};
-	wifi_config.sta.threshold.authmode = WIFI_AUTH_WPA2_PSK;
+	wifi_config.sta.threshold.authmode = WIFI_AUTH_WPA3_PSK;
 
 	strncpy(reinterpret_cast<char*>(wifi_config.sta.ssid    ), CONFIG_WIFI_SSID,     sizeof(wifi_config.sta.ssid    ));
 	strncpy(reinterpret_cast<char*>(wifi_config.sta.password), CONFIG_WIFI_PASSWORD, sizeof(wifi_config.sta.password));

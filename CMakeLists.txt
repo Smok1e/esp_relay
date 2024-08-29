@@ -7,3 +7,4 @@ project(main)
 
 idf_build_set_property(COMPILE_OPTIONS "-Wno-error=parentheses" APPEND)
 idf_build_set_property(COMPILE_OPTIONS "-Wno-parentheses" APPEND)
+idf_build_set_property(COMPILE_OPTIONS "-Wno-unused-variable" APPEND)
